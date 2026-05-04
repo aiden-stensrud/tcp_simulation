@@ -107,6 +107,10 @@ class TCPSender:
         self.outstanding = {}          # seq -> send_tick (unACKed frames only)
         self.dup_acks    = 0
         self.last_acked  = -1
+        self.estimated_rtt = 3.0
+        self.dev_rtt = 1.0
+        self.rto = self.estimated_rtt + 4 * self.dev_rtt
+        self.retransmitted = set()
 
     def effective_window(self, rwnd):
         return max(0, min(self.cwnd, rwnd, self.sws))
@@ -126,6 +130,7 @@ class TCPSender:
     def retransmit(self, seq, tick):
         if seq in self.outstanding:
             self.outstanding[seq] = tick
+            self.retransmitted.add(seq)
 
     def find_timed_out(self, tick, rto):
         """Return lowest-seq unACKed frame whose age >= rto, or None."""
@@ -136,14 +141,19 @@ class TCPSender:
                     candidate = seq
         return candidate
 
-    def on_new_ack(self, ack):
+    def on_new_ack(self, ack, tick):
         if ack <= self.LAR:
             return
-        self.dup_acks   = 0
+
+        self.update_rtt(ack, tick)
+
+        self.dup_acks = 0
         self.last_acked = ack
-        self.LAR        = ack
+        self.LAR = ack
+
         for seq in [s for s in self.outstanding if s <= self.LAR]:
             del self.outstanding[seq]
+            self.retransmitted.discard(seq)
 
         if self.state == self.SS:
             self.cwnd = min(self.cwnd + MSS, self.sws)
@@ -152,7 +162,7 @@ class TCPSender:
         elif self.state == self.CA:
             self.cwnd = min(self.cwnd + max(1, (MSS * MSS) // self.cwnd), self.sws)
         elif self.state == self.FR:
-            self.cwnd  = min(self.ssthresh, self.sws)
+            self.cwnd = min(self.ssthresh, self.sws)
             self.state = self.CA
 
     def on_dup_ack(self):
@@ -172,6 +182,25 @@ class TCPSender:
         self.cwnd     = MSS
         self.state    = self.SS
         self.dup_acks = 0
+        
+    def update_rtt(self, ack, tick):
+        # Karn's Algorithm: do not measure RTT for retransmitted packets
+        acked_seqs = [s for s in self.outstanding if s <= ack]
+
+        valid_samples = [
+            tick - self.outstanding[s]
+            for s in acked_seqs
+            if s not in self.retransmitted
+        ]
+
+        if not valid_samples:
+            return
+
+        sample_rtt = max(valid_samples)
+
+        self.estimated_rtt = 0.875 * self.estimated_rtt + 0.125 * sample_rtt
+        self.dev_rtt = 0.75 * self.dev_rtt + 0.25 * abs(sample_rtt - self.estimated_rtt)
+        self.rto = max(1, int(round(self.estimated_rtt + 4 * self.dev_rtt)))
 
 
 # ── Simulation loop ───────────────────────────────────────────────────────────
@@ -235,7 +264,7 @@ def main():
 
         if delivered_ack is not None:
             if delivered_ack > sender.LAR:
-                sender.on_new_ack(delivered_ack)
+                sender.on_new_ack(delivered_ack, t)
             else:
                 sender.on_dup_ack()
 
@@ -258,7 +287,7 @@ def main():
 
         # ── 4. Check for RTO ──────────────────────────────────────────────
         if event is None:
-            timed_out_seq = sender.find_timed_out(t, timeout)
+            timed_out_seq = sender.find_timed_out(t, sender.rto)
             if timed_out_seq is not None:
                 sender.on_timeout()
                 sender.retransmit(timed_out_seq, t)
@@ -306,11 +335,11 @@ def main():
         buf_str = ("(" + ",".join(str(x) for x in receiver.buffer) + ")"
                    if receiver.buffer else "()")
 
-        print("{:<5} {:<6} {:<10} {:<6} {:<6} {:<7} {:<6} {:<5} {}".format(
-            t, tx_str, event,
-            sender.cwnd, sender.ssthresh,
-            ack_str, rwnd_now, eff_now,
-            buf_str))
+        print("{:<5} {:<6} {:<10} {:<6} {:<6} {:<6} {:<7} {:<6} {:<5} {}".format(
+    t, tx_str, event,
+    sender.cwnd, sender.ssthresh, sender.rto,
+    ack_str, rwnd_now, eff_now,
+    buf_str))
 
 
 if __name__ == "__main__":
