@@ -1,2 +1,2 @@
-# tcp_simulation
-A simulation of the TCP congestion and flow control algorithms.
+# TCP Simulation
+By Kahlel Cardona, Prottasha Deb, and Aiden Stensrud
